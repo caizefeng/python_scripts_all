@@ -11,8 +11,7 @@ import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from numba import jit
-from scipy.spatial.distance import *
+from numba import njit
 from tqdm import tqdm
 
 
@@ -25,21 +24,21 @@ parser.add_argument("-s", "--step", type=float, default=0.1, help="Temperature s
 args = parser.parse_args()
 
 
-
 def initialize(N, T, rho):
     L, R = initPositions(N, rho)
-    V = initVelocities(N, T, R)
+    V = initVelocities(T, R)
     return L, R, V
 
 
-@jit('Tuple((float64, float64[:,:]))(uint16, float64)', nopython=True)
+@njit('Tuple((float64, float64[:,:]))(uint16, float64)')
 def initPositions(N, rho):
     L = (N/rho)**(1/3)
     M = math.ceil((N/4)**(1/3))
     a = L/M
-    cell = np.array([[0.25, 0.75, 0.75, 0.25],
-                     [0.25, 0.75, 0.25, 0.75],
-                     [0.25, 0.25, 0.75, 0.75]])
+    cell = np.array([[0.25, 0.25, 0.25],
+                     [0.75, 0.75, 0.25],
+                     [0.75, 0.25, 0.75],
+                     [0.25, 0.75, 0.75]])
 #     buf = array.array("d")
     R = np.zeros((N, 3))
     p = 0
@@ -48,7 +47,7 @@ def initPositions(N, rho):
             for z in range(M):
                 for k in range(4):
                     if p < N:
-                        R[p] = (np.array([x, y, z]) + cell[:, k])*a
+                        R[p] = (np.array([x, y, z]) + cell[k, :])*a
 #                         buf.append((x+cell[0, k])*a)
 #                         buf.append((y+cell[1, k])*a)
 #                         buf.append((z+cell[2, k])*a)
@@ -57,16 +56,17 @@ def initPositions(N, rho):
     return L, R
 
 
-@jit(["float64[:,:](uint16, float64, float64[:,:])"], nopython=True)
+@njit("float64[:,:](uint16, float64, float64[:,:])")
 def rescaleVelocities(N, T, V):
-    vSqdSum = np.sum((V**2).reshape((1, -1)))  # reshape is viewing
+    vSqdSum = np.sum(V**2)  # reshape is viewing
     lamda = math.sqrt(3 * (N-1) * T / vSqdSum)  # lambda is keyword in py
     V *= lamda
     return V
 
 
-@jit(["float64[:,:](uint16, float64, float64[:,:])"], nopython=True)
-def initVelocities(N, T, R):
+@njit("float64[:,:](float64, float64[:,:])")
+def initVelocities(T, R):
+    N = R.shape[0]
     V = np.random.randn(*R.shape)
 #     V -= V.mean()  ## not supported by numba
     V -= V.sum()/N
@@ -74,15 +74,18 @@ def initVelocities(N, T, R):
     return V
 
 
-@jit('Tuple((float64[:,:], float64))(uint16, float64, float64[:,:])', nopython=True)
+@njit('Tuple((float64[:,:], float64))(uint16, float64, float64[:,:])')
 def computeAccelerations(N, L, R):
     poten_tot = 0
     A = np.zeros((N, 3))
     for i in range(N-1):
         for j in range(i+1, N):
             rij = R[i]-R[j]
-            rij = np.where(rij > 0.5 * L, rij-L, rij)  # PBC
-            rij = np.where(rij < -0.5 * L, rij+L, rij)  # PBC
+            for k in range(3):
+                if rij[k] > 0.5 * L:
+                    rij[k] -= L  # PBC
+                elif rij[k] < -0.5 * L:
+                    rij[k] += L
             rSqd = np.sum(rij**2)
             poten_tot += 4 * (rSqd ** (-6) - rSqd ** (-3))
             f = 24 * (2 * rSqd ** (-7) - rSqd**(-4))
@@ -91,56 +94,85 @@ def computeAccelerations(N, L, R):
     return A, poten_tot
 
 
-
-@jit('Tuple((float64[:,:], float64[:,:], float64))(float64, uint16, float64, float64[:,:], float64[:,:])', nopython=True)
+@njit('Tuple((float64[:,:], float64[:,:], float64))(float64, uint16, float64, float64[:,:], float64[:,:])')
 def velocityVerlet(dt, N, L, R, V):
     A = computeAccelerations(N, L, R)[0]
     R += V * dt + 0.5 * A * dt ** 2
-    R = np.where(R < 0, R + L, R)  # PBC
-    R = np.where(R > L, R - L, R)  # PBC
+    for i in range(R.shape[0]):
+        for j in range(R.shape[1]):
+            if R[i, j] > L:
+                R[i, j] -= L  # PBC
+            elif R[i, j] < -0.5 * L:
+                R[i, j] += L
+#     R = np.where(R < 0, R + L, R)  # PBC
+#     R = np.where(R > L, R - L, R)  # PBC
     V += 0.5 * A * dt
     A, poten_tot = computeAccelerations(N, L, R)
     V += 0.5 * A * dt
     return R, V, poten_tot
 
 
-@jit(["Tuple((float64, float64))(uint16, float64[:,:])"], nopython=True)
+@njit("Tuple((float64, float64))(uint16, float64[:,:])")
 def instantaneousTemperature(N, V):
-    T_sum = np.sum((V**2).reshape((1, -1)))
+    T_sum = np.sum(V**2)
     kne_en = T_sum / 2
     return T_sum / (3 * (N-1)), kne_en
 
-@jit(["float64(uint16, uint16, float64, float64[:,:])"], nopython=True)
+
+@njit("float64(uint16, uint16, float64, float64[:,:])")
 def instantaneousEnergy(particle_index, N, L, R):
     poten_sing = 0
     for i in range(N):
         if i != particle_index:
             rij = R[i] - R[particle_index]
-            rij = np.where(rij > 0.5 * L, rij-L, rij)  # PBC
-            rij = np.where(rij < -0.5 * L, rij+L, rij)  # PBC
+            for k in range(3):
+                if rij[k] > 0.5 * L:
+                    rij[k] -= L  # PBC
+                elif rij[k] < -0.5 * L:
+                    rij[k] += L
             rSqd = np.sum(rij**2)
             poten_sing += 4 * (rSqd ** (-6) - rSqd ** (-3))
     return poten_sing
 
-@jit(["float64(uint16, float64, float64[:,:])"], nopython=True)
-def instantaneousDistance(N, L, R):
-    r_list_all = []
+
+@njit('uint16[:,:](uint16)')
+def crossindex(N):
+    index_array = np.empty((N, N-1), dtype=np.uint16)
+    all_index = list(range(N))
     for i in range(N):
-        r_list = []
-        for j in range(N):
-            if j != i:
-                rij = R[i]-R[j]
-                rij = np.where(rij > 0.5 * L, rij-L, rij)  # PBC
-                rij = np.where(rij < -0.5 * L, rij+L, rij)  # PBC
-                r = np.sqrt(np.sum(rij**2))
-                r_list.append(r)
-        r_list_all.append(np.array(r_list).min())  # smallest distance
-    dist_mean = np.array(r_list_all).sum()/N
+        for j, num in enumerate(all_index[:i] + all_index[i+1:]):
+            index_array[i, j] = num
+    return index_array
+
+
+@njit('float64(float64[:,:])')
+def min_mean(array):
+    N = array.shape[0]
+    result = 0
+    for i in range(N):
+        result += np.min(array[i,:])
+    return result/N
+
+
+@njit("float64(uint16, float64, float64[:,:])")
+def instantaneousDistance(N, L, R):
+    index_array = crossindex(N)
+    cross_distance = np.zeros((N, N-1))
+    for i in range(N):
+        for j in range(N-1):
+            rij = R[i]-R[index_array[i, j]]
+            for k in range(3):
+                if rij[k] > 0.5 * L:
+                    rij[k] -= L  # PBC
+                elif rij[k] < -0.5 * L:
+                    rij[k] += L
+            r = np.sqrt(np.sum(rij**2))
+            cross_distance[i, j] = r
+    dist_mean =  min_mean(cross_distance)
     return dist_mean
 
 
 def plot_gen(T):
-    # %matplotlib widget
     plt.title("Instantaneous Temperature")
     plt.xlabel("step")
     plt.ylabel("temperature")
@@ -191,6 +223,7 @@ def plot_gen(T):
     plt.savefig('2_dist_mean_{}.png'.format(T), dpi=300)
     plt.close()
 
+
 def main(T=1.0, iter_T=False):
     if not iter_T:
         dir_name = 'md2_{}'.format(T)
@@ -221,7 +254,7 @@ def main(T=1.0, iter_T=False):
                 if (i % 200 == 0):
                     V = rescaleVelocities(N, T, V)
                 if i == 999:
-                    llast_step = [poten_sing, poten_tot,
+                    last_step = [poten_sing, poten_tot,
                              poten_tot + kne_en, dist_mean]
         plot_gen(T)
         os.chdir(sys.path[0])
@@ -238,6 +271,7 @@ def main(T=1.0, iter_T=False):
                 last_step = [poten_sing, poten_tot,
                              poten_tot + kne_en, dist_mean]
     return last_step
+
 
 def iter_T(list_T=[0.1*(i+1) for i in range(10)]):
     dir_name = 'md2_iter_{0}_{1}'.format(list_T[0], list_T[-1])
@@ -290,8 +324,8 @@ def plot_gen_iter(list_T, list_singpen, list_totpen, list_toten,
     plt.savefig('2_dist_mean.png', dpi=300)
     plt.close()
     
-os.chdir(sys.path[0])
 
+os.chdir(sys.path[0])
 if args.typecal == 'single':
     main(args.Temperature)
 elif args.typecal == 'multiple':

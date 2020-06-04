@@ -1,0 +1,8 @@
+*.pyc
+*checkpoint.ipynb
+*.png
+*.log
+*.out
+*ipynb_checkpoints*
+
+*CHGCAR*
